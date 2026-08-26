@@ -192,6 +192,56 @@ fn parse_sched_spread(value: Option<&str>) -> Option<&'static str> {
     }
 }
 
+/// Which local engine backs a resolved `ModelPath::SafeTensors`
+/// directory: `mlx_lm.server` (see `spawn_mlx_server`) when
+/// [`safetensors_engine_from_env`] says so explicitly, or — absent that
+/// — when this host is Apple Silicon macOS
+/// (`crate::hostgpu::detect() == HostGpu::Metal`) *and* `mlx_lm.server`
+/// is actually on `PATH`; `vllm` in every other case, unchanged from
+/// before this engine existed.
+///
+/// Plain `vllm` (no plugin) has no Metal backend of its own at all — its
+/// upstream-published macOS wheel is CPU-only. There *is* a way to make
+/// `vllm serve` itself Metal-accelerated on Apple Silicon —
+/// [vllm-metal](https://github.com/vllm-project/vllm-metal), an
+/// installed-alongside `vllm.platform_plugins` plugin that overrides its
+/// `CpuPlatform` autodetection with a real `MetalPlatform` (itself
+/// implemented on top of MLX — see the `e2e` CI job's own "Install vLLM
+/// (e2e)" step) — but it only supports a narrower set of model
+/// families than `mlx_lm.server` does directly, and pulls in vLLM's own
+/// full dependency footprint for a user who may not want any of the rest
+/// of it. `mlx_lm.server` here is a separate, no-vLLM-at-all option: a
+/// Mac with `mlx-lm` installed gets real Metal acceleration through it
+/// without needing vllm-metal (or vllm) at all; a Mac with neither still
+/// falls back to plain (CPU-only, absent vllm-metal) `vllm` instead of
+/// failing outright.
+fn use_mlx_for_safetensors() -> bool {
+    safetensors_engine_from_env().unwrap_or_else(|| {
+        crate::hostgpu::detect() == crate::hostgpu::HostGpu::Metal
+            && which_binary("mlx_lm.server").is_ok()
+    })
+}
+
+/// Explicit engine override for [`use_mlx_for_safetensors`], read from
+/// `LLMMAN_SAFETENSORS_ENGINE` (an env var, not a `llmman serve` flag,
+/// mirroring every other `*_from_env` helper here) — `"mlx"`/`"vllm"`
+/// force that engine regardless of host auto-detection; anything else
+/// (unset, empty, a typo) defers to auto-detection instead of refusing
+/// to start, same as every other helper in this file.
+fn safetensors_engine_from_env() -> Option<bool> {
+    parse_safetensors_engine(std::env::var("LLMMAN_SAFETENSORS_ENGINE").ok().as_deref())
+}
+
+/// [`safetensors_engine_from_env`]'s parsing, split out so it's testable
+/// without mutating the real process environment.
+fn parse_safetensors_engine(value: Option<&str>) -> Option<bool> {
+    match value?.trim().to_ascii_lowercase().as_str() {
+        "mlx" => Some(true),
+        "vllm" => Some(false),
+        _ => None,
+    }
+}
+
 /// Explicit `--context-shift`/`--no-context-shift` override from
 /// `LLMMAN_CONTEXT_SHIFT`, or `None` if unset/empty/unparseable — in
 /// which case [`supports_context_shift`]'s per-model default applies
@@ -386,6 +436,14 @@ struct RunningModel {
     /// `ActivityGuard`'s doc comment for why a generation slower than its
     /// own `keep_alive` must not be killed mid-stream.
     in_flight: u32,
+    /// `Some(<absolute model directory path>)` only for `Engine::Mlx`,
+    /// `None` for every other engine — see `backend_wire_model`'s own
+    /// doc comment for what this is actually for (the `"model"` field a
+    /// request must carry to reach *this* model on an `mlx_lm.server`
+    /// backend, since it has no `--served-model-name`-equivalent way to
+    /// register a human-readable alias for it up front the way `vllm`
+    /// does).
+    backend_model_path: Option<String>,
 }
 
 /// Which engine is actually serving requests for a [`RunningModel`] — surfaced
@@ -399,6 +457,7 @@ impl RunningModel {
         match &self.process {
             ModelProcess::Local(Engine::LlamaServer, _, _) => "llama-server (local)".into(),
             ModelProcess::Local(Engine::Vllm, _, _) => "vllm (local)".into(),
+            ModelProcess::Local(Engine::Mlx, _, _) => "mlx (local)".into(),
             ModelProcess::Container(ociman, _) => {
                 format!("llama-server (container/{})", ociman.binary())
             }
@@ -415,17 +474,26 @@ impl RunningModel {
 
 /// Which local engine a [`ModelProcess::Local`] is running — see
 /// [`RunningModel::processor`].
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Engine {
     LlamaServer,
     Vllm,
+    /// `mlx_lm.server` (the `mlx-lm` PyPI package) — Apple Silicon's own
+    /// Metal-accelerated alternative to `vllm` for a
+    /// [`ModelPath::SafeTensors`] directory, picked instead of it when
+    /// [`use_mlx_for_safetensors`] says so. See [`spawn_mlx_server`]'s
+    /// doc comment for why this engine's requests need a different
+    /// `"model"` field than every other one (handled by
+    /// [`backend_wire_model`]), not anything here.
+    Mlx,
 }
 
-/// A running inference backend: either a local `llama-server`/`vllm`
-/// process (killed via `Child::kill_on_drop`, except `Engine::Vllm` —
-/// see this Drop impl) or an attached `docker run`/`podman run` process,
-/// gracefully stopped via SIGTERM on drop since `kill_on_drop`'s SIGKILL
-/// can't be forwarded to (and so doesn't stop) the container.
+/// A running inference backend: either a local `llama-server`/`vllm`/
+/// `mlx_lm.server` process (killed via `Child::kill_on_drop`, except
+/// `Engine::Vllm` — see this Drop impl) or an attached `docker run`/
+/// `podman run` process, gracefully stopped via SIGTERM on drop since
+/// `kill_on_drop`'s SIGKILL can't be forwarded to (and so doesn't stop)
+/// the container.
 enum ModelProcess {
     // `Option<u32>` is the pid captured right after spawn, not
     // `child.id()` at drop time: `is_alive`'s `try_wait` reaps the child
@@ -463,6 +531,12 @@ impl Drop for ModelProcess {
             }
             #[cfg(not(unix))]
             ModelProcess::Local(Engine::Vllm, _, _) => {}
+            // `mlx_lm.server` runs entirely as one process — a single
+            // background generation thread plus a `ThreadingHTTPServer`,
+            // no forked worker tree of its own the way vllm has above —
+            // so the plain default `kill_on_drop` SIGKILL to just this
+            // one pid is already sufficient; nothing extra to do here.
+            ModelProcess::Local(Engine::Mlx, _, _) => {}
             ModelProcess::Local(Engine::LlamaServer, _, _) => {}
         }
     }
@@ -1650,6 +1724,46 @@ async fn spawn_vllm_server(
         .with_context(|| format!("spawn vllm from {}", vllm.display()))
 }
 
+/// Spawns `mlx_lm.server` (installed on `PATH` by `pip install mlx-lm`
+/// <https://github.com/ml-explore/mlx-lm>) — Apple Silicon's own
+/// Metal-accelerated alternative to `vllm` for a
+/// [`ModelPath::SafeTensors`] directory, picked instead of it by
+/// [`use_mlx_for_safetensors`].
+///
+/// Deliberately does *not* pass `mlx_lm.server`'s own `--model` flag,
+/// even though that's its documented way to preload one: confirmed
+/// against its own `server.py` that doing so loads the model in a
+/// background thread (`ResponseGenerator.__init__`'s
+/// `Thread(target=self._generate)`) with no `try`/`except` anywhere
+/// around that particular load — a bad model directory would silently
+/// kill only that one thread, not this process, while its
+/// `ThreadingHTTPServer` (started right alongside it, not after) keeps
+/// right on reporting `/health` as ready regardless. `wait_for_ready`
+/// would then report this backend ready, and every real request queued
+/// behind that dead thread would hang forever instead of ever seeing an
+/// error.
+///
+/// Loading instead happens on the *first real request* — every caller
+/// sends this model's actual absolute directory path (not its
+/// human-readable reference) as that request's own `"model"` field, via
+/// [`backend_wire_model`] — which goes through `ModelProvider.load`'s
+/// own `try`/`except` in the request-handling path instead, and so does
+/// report a real error back to that request on a bad model directory.
+async fn spawn_mlx_server(port: u16) -> anyhow::Result<tokio::process::Child> {
+    let mlx = which_binary("mlx_lm.server")?;
+    let mut cmd = tokio::process::Command::new(&mlx);
+    cmd.args(["--port", &port.to_string(), "--host", "127.0.0.1"]);
+    // Same rationale as LLMMAN_VLLM_ARGS above — e.g. --trust-remote-code
+    // for a model whose tokenizer needs it, or --chat-template-args for
+    // one whose default chat template needs a kwarg overridden.
+    if let Ok(extra) = std::env::var("LLMMAN_MLX_ARGS") {
+        cmd.args(extra.split_whitespace());
+    }
+    cmd.kill_on_drop(true)
+        .spawn()
+        .with_context(|| format!("spawn mlx_lm.server from {}", mlx.display()))
+}
+
 fn find_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
@@ -1711,7 +1825,15 @@ async fn wait_for_ready(
         }
         if let Ok(resp) = client.get(&url).send().await {
             // llama-server: 200 + {"status":"ok"}   vllm: 200 + {}
-            // Both return HTTP 200 only when fully ready.
+            // mlx_lm.server: 200 + {"status":"ok"} — but, unlike the other
+            // two, this only means its HTTP listener itself is up, not
+            // that any model has finished loading (mlx_lm.server never
+            // preloads one at all here — see spawn_mlx_server's doc
+            // comment on why). Its own request-handling path still waits
+            // out that load before answering, so this is only ever a
+            // "the process didn't crash outright" check for that engine,
+            // not a full readiness one — an intentional, documented
+            // trade-off, not an oversight.
             if resp.status().is_success() {
                 return Ok(());
             }
@@ -2055,6 +2177,11 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
                 stderr_tail = Some(tail);
                 ModelProcess::Local(Engine::LlamaServer, child, None)
             }
+            (ModelPath::SafeTensors(_dir), _) if use_mlx_for_safetensors() => {
+                let child = spawn_mlx_server(port).await?;
+                let pid = child.id();
+                ModelProcess::Local(Engine::Mlx, child, pid)
+            }
             (ModelPath::SafeTensors(dir), _) => {
                 let child = spawn_vllm_server(dir, port, model_ref).await?;
                 let pid = child.id();
@@ -2133,6 +2260,16 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
     }
     eprintln!("[llmman] {model_ref} ready on port {port}");
 
+    // See RunningModel::backend_model_path's own doc comment — only
+    // meaningful for Engine::Mlx, which is the only engine
+    // spawn_mlx_server deliberately doesn't preload via `--model` for
+    // (see its own doc comment), so every request must instead carry
+    // this exact directory as its own "model" field.
+    let backend_model_path = match &process {
+        ModelProcess::Local(Engine::Mlx, _, _) => model_path.path().to_str().map(|s| s.to_string()),
+        _ => None,
+    };
+
     state.0.manager.lock().await.running.insert(
         model_ref.to_string(),
         RunningModel {
@@ -2143,11 +2280,40 @@ async fn ensure_model(state: &AppState, model_ref: &str) -> Result<(String, u16)
             started_at: now_rfc3339(),
             last_active: Instant::now(),
             last_active_wall: chrono::Utc::now(),
+            backend_model_path,
             keep_alive: default_keep_alive(),
             in_flight: 0,
         },
     );
     Ok((model_ref.to_string(), port))
+}
+
+/// The `"model"` value to actually put in the JSON request body sent to
+/// `canonical_model`'s backend process — `canonical_model` itself
+/// (`ensure_model`'s return value, already the exact name every other
+/// engine needs — see its own doc comment) for everything except a
+/// running `Engine::Mlx` backend, for which it's that model's real
+/// on-disk directory path instead (`RunningModel::backend_model_path` —
+/// see `spawn_mlx_server`'s doc comment for why `mlx_lm.server` needs
+/// that rather than a human-readable name at all).
+///
+/// Every caller must apply this only to the request forwarded to the
+/// backend — client-facing response bodies (an Ollama chunk's `model`
+/// field, an Anthropic message's `model` field, ...) must keep echoing
+/// back `canonical_model` or the client's own original input unchanged;
+/// a client asking for "gemma4:latest" should never see
+/// "/Users/.../cache/.../abcd1234" reflected back at it just because
+/// that happens to be how this one engine addresses it internally.
+async fn backend_wire_model(state: &AppState, canonical_model: &str) -> String {
+    state
+        .0
+        .manager
+        .lock()
+        .await
+        .running
+        .get(canonical_model)
+        .and_then(|r| r.backend_model_path.clone())
+        .unwrap_or_else(|| canonical_model.to_string())
 }
 
 /// Returns the local llama-server binary to spawn: the one resolved at
@@ -3219,8 +3385,13 @@ async fn handle_ollama_chat(
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(&state, &model, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // See backend_wire_model's own doc comment — usually just `model`
+    // itself, but a different value for an Engine::Mlx backend. Only
+    // this one outgoing request field, never the response chunk's own
+    // `model` field below (which must keep echoing back `model` as-is).
+    let wire_model = backend_wire_model(&state, &model).await;
     let oai = OAIChatRequest {
-        model: model.clone(),
+        model: wire_model,
         messages: req.messages.iter().map(ollama_message_to_oai).collect(),
         stream: true,
         temperature: opt_f64(&req.options, "temperature"),
@@ -3323,8 +3494,10 @@ async fn handle_ollama_generate(
     let keep_alive = resolve_keep_alive(&req.keep_alive);
     let activity = begin_activity(&state, &model, Some(keep_alive)).await;
     let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+    // See backend_wire_model's own doc comment.
+    let wire_model = backend_wire_model(&state, &model).await;
     let oai = OAIChatRequest {
-        model: model.clone(),
+        model: wire_model,
         messages: vec![OAIMessage::text("user", req.prompt.clone())],
         stream: true,
         temperature: opt_f64(&req.options, "temperature"),
@@ -3419,7 +3592,9 @@ async fn resolve_openai_request(
     // a `keep_alive: -1` ("never unload") pin with the daemon default the
     // instant one OpenAI-compatible request comes in.
     let activity = begin_activity(state, &model, None).await;
-    req["model"] = serde_json::Value::String(model);
+    // See backend_wire_model's own doc comment — usually just `model`
+    // itself, but a different value for an Engine::Mlx backend.
+    req["model"] = serde_json::Value::String(backend_wire_model(state, &model).await);
     Ok((req, port, activity))
 }
 
@@ -3745,8 +3920,12 @@ async fn handle_anthropic_messages(
 
     let messages = build_anthropic_messages(&req);
 
+    // See backend_wire_model's own doc comment — usually just
+    // canonical_model itself, but a different value for an Engine::Mlx
+    // backend.
+    let wire_model = backend_wire_model(&state, &canonical_model).await;
     let mut oai = OAIChatRequest {
-        model: canonical_model,
+        model: wire_model,
         messages,
         stream: req.stream,
         temperature: req.temperature,
@@ -4577,9 +4756,72 @@ mod tests {
             started_at: now_rfc3339(),
             last_active: Instant::now() - idle_for,
             last_active_wall: chrono::Utc::now(),
+            backend_model_path: None,
             keep_alive,
             in_flight,
         }
+    }
+
+    /// Like `running_model_fixture`, but with a caller-chosen `Engine`
+    /// and `backend_model_path` — used only by `backend_wire_model`'s
+    /// own tests below, which need to distinguish an `Engine::Mlx`
+    /// backend from every other one.
+    fn running_model_fixture_with_engine(
+        engine: Engine,
+        backend_model_path: Option<&str>,
+    ) -> RunningModel {
+        RunningModel {
+            process: ModelProcess::Local(engine, spawn_placeholder_process(), None),
+            port: 0,
+            digest: String::new(),
+            size: 0,
+            started_at: now_rfc3339(),
+            last_active: Instant::now(),
+            last_active_wall: chrono::Utc::now(),
+            backend_model_path: backend_model_path.map(|s| s.to_string()),
+            keep_alive: None,
+            in_flight: 0,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_wire_model_is_the_canonical_name_for_every_engine_except_mlx() {
+        let state = test_state();
+        {
+            let mut mgr = state.0.manager.lock().await;
+            mgr.running.insert(
+                "llama-model".into(),
+                running_model_fixture_with_engine(Engine::LlamaServer, None),
+            );
+            mgr.running.insert(
+                "vllm-model".into(),
+                running_model_fixture_with_engine(Engine::Vllm, None),
+            );
+            mgr.running.insert(
+                "mlx-model".into(),
+                running_model_fixture_with_engine(Engine::Mlx, Some("/cache/mlx-model/abcd")),
+            );
+        }
+
+        assert_eq!(
+            backend_wire_model(&state, "llama-model").await,
+            "llama-model"
+        );
+        assert_eq!(backend_wire_model(&state, "vllm-model").await, "vllm-model");
+        assert_eq!(
+            backend_wire_model(&state, "mlx-model").await,
+            "/cache/mlx-model/abcd",
+            "an Engine::Mlx backend must be addressed by its real directory path, not its human-readable name"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn backend_wire_model_falls_back_to_the_canonical_name_when_not_running() {
+        let state = test_state();
+        assert_eq!(
+            backend_wire_model(&state, "not-running").await,
+            "not-running"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -4826,6 +5068,22 @@ mod tests {
         assert_eq!(parse_kv_cache_type(None), None);
         assert_eq!(parse_kv_cache_type(Some("")), None);
         assert_eq!(parse_kv_cache_type(Some("   ")), None);
+    }
+
+    #[test]
+    fn parse_safetensors_engine_accepts_mlx_and_vllm_case_insensitively() {
+        assert_eq!(parse_safetensors_engine(Some("mlx")), Some(true));
+        assert_eq!(parse_safetensors_engine(Some(" MLX \n")), Some(true));
+        assert_eq!(parse_safetensors_engine(Some("vllm")), Some(false));
+        assert_eq!(parse_safetensors_engine(Some(" VLLM \n")), Some(false));
+    }
+
+    #[test]
+    fn parse_safetensors_engine_defers_to_auto_detection_when_unset_or_unparseable() {
+        assert_eq!(parse_safetensors_engine(None), None);
+        assert_eq!(parse_safetensors_engine(Some("")), None);
+        assert_eq!(parse_safetensors_engine(Some("   ")), None);
+        assert_eq!(parse_safetensors_engine(Some("garbage")), None);
     }
 
     #[test]

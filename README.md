@@ -59,7 +59,7 @@ Any source `llmman pull` understands (an OCI registry, `hf://`, `ms://`, ...) ca
 
 ### Serve
 
-Start the inference server. Uses `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp) if it's already on `PATH`; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release).
+Start the inference server. GGUF models are served by `llama-server` from [llama.cpp](https://github.com/ggml-org/llama.cpp), used from `PATH` if it's already there; otherwise `llmman` downloads and caches a prebuilt release matching your OS/arch/GPU automatically (see `--llama-cpp-version` to pin a specific release). Safetensors models are served by [`vllm`](https://github.com/vllm-project/vllm) (plain `vllm` is CPU-only on macOS, unless you separately install [vllm-metal](https://github.com/vllm-project/vllm-metal) for Metal GPU support) — or, on Apple Silicon macOS, by [`mlx-lm`](https://github.com/ml-explore/mlx-lm)'s `mlx_lm.server` instead when it's on `PATH`: Metal-accelerated with no vLLM dependency at all, and no narrower model-family support the way vllm-metal has. `pip install mlx-lm` to opt in; set `LLMMAN_SAFETENSORS_ENGINE=vllm`/`mlx` to force one or the other.
 
 ```
 llmman serve
@@ -108,6 +108,9 @@ Daemon-wide `llama-server` tuning, set before `llmman serve` starts:
 | `LLMMAN_KV_CACHE_TYPE` | KV-cache quantization (`--cache-type-k`/`--cache-type-v`), e.g. `f16` (default), `q8_0`, `q4_0` — trades output quality for memory at long context lengths, matching Ollama's `OLLAMA_KV_CACHE_TYPE`. |
 | `LLMMAN_MODELS` | Local store directory, overriding the default below — matching Ollama's `OLLAMA_MODELS`. `pull`/`push`/`run`/etc. go through the daemon and always use whichever store it was started with. |
 | `LLMMAN_TMPDIR` | Staging directory for `llama-server` release downloads, overriding the default `tmp` subdirectory of the install root — matching Ollama's `OLLAMA_TMPDIR`. |
+| `LLMMAN_SAFETENSORS_ENGINE` | Which engine serves a safetensors model: `vllm` or `mlx`. Unset auto-detects — `mlx_lm.server` on Apple Silicon macOS when it's on `PATH`, `vllm` otherwise. |
+| `LLMMAN_VLLM_ARGS` | Extra space-separated arguments appended to `vllm serve`'s own command line, e.g. `--gpu-memory-utilization 0.6`. |
+| `LLMMAN_MLX_ARGS` | Extra space-separated arguments appended to `mlx_lm.server`'s own command line, e.g. `--trust-remote-code`. |
 
 ### Benchmark
 
@@ -144,6 +147,26 @@ models. The [`vllm-llmman`](https://pypi.org/project/vllm-llmman/) plugin
 is the inverse: install it alongside `vllm` and `vllm serve
 oci://<reference>` pulls a CNCF ModelPack image directly, instead of a
 HuggingFace repo.
+
+### MLX (Apple Silicon)
+
+On Apple Silicon macOS, `llmman serve` uses
+[`mlx_lm.server`](https://github.com/ml-explore/mlx-lm) — Metal-accelerated,
+with no vLLM dependency at all (unlike getting the same acceleration out of
+`vllm serve` itself via [vllm-metal](https://github.com/vllm-project/vllm-metal))
+— as the backend for safetensors models instead of `vllm`, whenever it's on
+`PATH`:
+
+```
+pip install mlx-lm
+llmman pull mlx-community/Qwen3-4B-4bit
+llmman serve
+```
+
+Falls back to `vllm` if `mlx-lm` isn't installed. Set
+`LLMMAN_SAFETENSORS_ENGINE=mlx`/`vllm` to force one or the other
+explicitly instead of relying on auto-detection, and `LLMMAN_MLX_ARGS`
+for any extra `mlx_lm.server` flags (e.g. `--trust-remote-code`).
 
 ## Store location
 
