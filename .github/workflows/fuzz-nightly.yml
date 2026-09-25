@@ -36,7 +36,7 @@ jobs:
       # each target's findings are independent.
       fail-fast: false
       matrix:
-        target: [parse_registry_ref, validate_reference, resolve_ollama_api]
+        target: [parse_registry_ref, validate_reference, resolve_ollama_api, read_gguf_info, parse_oci_json]
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 

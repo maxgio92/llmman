@@ -290,20 +290,29 @@ jobs:
 
       # `fuzzing` gates the fuzz_check_* wrappers in src/shortnames.rs
       # (parse_registry_ref, validate_reference, resolve_ollama_api),
-      # which only the fuzz/ crate calls; without this a rename there
-      # compiles clean everywhere and only breaks the fuzz harness. This
-      # compiles the feature, it does not run cargo-fuzz (needs nightly;
-      # actual fuzzing runs nightly in fuzz-nightly.yml).
+      # src/gguf.rs (read_gguf_info) and src/storage/oci.rs
+      # (parse_oci_json), which only the fuzz/ crate calls; without this
+      # a rename there compiles clean everywhere and only breaks the fuzz
+      # harness. This compiles the feature, it does not run cargo-fuzz
+      # (needs nightly; actual fuzzing runs nightly in fuzz-nightly.yml).
       - name: cargo clippy --features fuzzing
         if: matrix.check-fmt
         run: cargo clippy --features fuzzing --lib -- -D warnings
 
       # fuzz/ is its own crate (cargo-fuzz convention), so the workspace
       # clippy/test steps never touch it. A plain check catches it going
-      # stale against src/shortnames.rs without cargo-fuzz or nightly.
+      # stale against the fuzz_check_* wrappers without cargo-fuzz or
+      # nightly. --locked fails instead of silently rewriting
+      # fuzz/Cargo.lock whenever Cargo would need to change it: a
+      # dependency added to or bumped in fuzz/Cargo.toml, or the root
+      # crate's version (stamped by packaging/version.sh into both
+      # lockfiles) no longer matching the `llmman` entry. It does not
+      # compare fuzz/Cargo.lock's pins against the root Cargo.lock; the
+      # two may legitimately resolve a shared dependency differently. See
+      # fuzz/README.md's lockfile-drift section for the bump procedure.
       - name: cargo check fuzz/
         if: matrix.check-fmt
-        run: cargo check --manifest-path fuzz/Cargo.toml
+        run: cargo check --manifest-path fuzz/Cargo.toml --locked
 
       # -D warnings: the tree is clippy-clean, so anything new is a
       # regression. --all-targets covers tests/ too. Default (docker)

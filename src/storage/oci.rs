@@ -912,6 +912,120 @@ pub fn tag_from_ref(reference: &str) -> &str {
     "latest"
 }
 
+/// Parses `data` as each OCI JSON document the stores read from disk and
+/// panics unless every successful parse holds the invariants the code
+/// relies on. Shared oracle for the fuzz target and the seed-corpus unit
+/// test. Covers the deserializing types only: `crate::hf::oci`'s
+/// `ModelDescriptor`/`ModelFS`/`ModelConfig` are build-side `Serialize`
+/// structs whose parsed counterpart is [`CncfModelConfig`].
+///
+/// Checked per type:
+///   - second-generation round-trip stability: `v1 = to_value(parse(data))`
+///     and `v2 = to_value(parse(v1.to_string()))` are equal, so a document
+///     the store wrote from a parsed one reads back identically (the
+///     serde attributes drop unknown fields and fold `null` into `None`,
+///     so `v1 == data` is not claimed). `serde_json::Value` maps are
+///     `BTreeMap`-ordered (no `preserve_order` feature), so the comparison
+///     is deterministic even though [`Descriptor::annotations`] is a
+///     `HashMap`;
+///   - for [`Descriptor`]: [`split_digest`] accepts the digest iff it
+///     contains a `:`, the one shape rule `read_blob` needs (there is no
+///     `algo:hex` character validation on the read path today), and the
+///     `org.opencontainers.image.ref.name` annotation, when present,
+///     is settled by one [`default_tag`] call, keeps its [`repo_name`]
+///     through it, and (when digest-free) matches its own descriptor via
+///     [`ref_matches_precise`] and [`matching_index`].
+///   - [`Manifest`]: the same digest and `ref.name` checks on `config`
+///     and every layer.
+///
+/// Acceptance is deliberately not cross-checked between this module's
+/// types and `crate::hf::oci`'s: `size`/`schemaVersion` are `u64`/`u32`
+/// here and `i64`/`i32` there, so the two legitimately disagree on
+/// negative and above-`i64::MAX` inputs.
+#[cfg(any(test, feature = "fuzzing"))]
+fn assert_oci_json_invariants(data: &[u8]) {
+    fn round_trip<T: Serialize + serde::de::DeserializeOwned>(data: &[u8]) -> Option<T> {
+        let parsed: T = serde_json::from_slice(data).ok()?;
+        let v1 = serde_json::to_value(&parsed).expect("serialize a parsed document");
+        let reparsed: T = serde_json::from_str(&v1.to_string())
+            .expect("re-parse the serialization of a parsed document");
+        let v2 = serde_json::to_value(&reparsed).expect("serialize a re-parsed document");
+        assert_eq!(v1, v2, "second-generation round trip changed the document");
+        Some(parsed)
+    }
+
+    fn assert_descriptor(desc: &Descriptor) {
+        assert_eq!(
+            split_digest(&desc.digest).is_ok(),
+            desc.digest.contains(':'),
+            "split_digest disagrees with the ':' rule on {:?}",
+            desc.digest
+        );
+        let Some(name) = desc
+            .annotations
+            .as_ref()
+            .and_then(|a| a.get("org.opencontainers.image.ref.name"))
+        else {
+            return;
+        };
+        // Every helper returns a slice of `name` or `name + ":latest"`,
+        // so substring checks would hold by construction. These are the
+        // contracts the store reads back through instead:
+        // `ref_path_segments` assumes one `default_tag` call settles the
+        // tag, `ref_matches_precise`'s digest branch compares repo_name
+        // of stored vs base, and a digest-free stored name must find
+        // itself.
+        let defaulted = default_tag(name);
+        assert_eq!(
+            default_tag(&defaulted),
+            defaulted,
+            "default_tag is not idempotent on {name:?}"
+        );
+        assert_eq!(
+            repo_name(&defaulted),
+            repo_name(name),
+            "default_tag changed the repository of {name:?}"
+        );
+        if split_ref_digest(name).1.is_none() {
+            assert!(
+                ref_matches_precise(desc, name),
+                "a descriptor does not match its own ref.name {name:?}"
+            );
+            assert_eq!(
+                matching_index(std::slice::from_ref(desc), name),
+                Some(0),
+                "matching_index misses the only descriptor for {name:?}"
+            );
+        }
+    }
+
+    if let Some(desc) = round_trip::<Descriptor>(data) {
+        assert_descriptor(&desc);
+    }
+    if let Some(manifest) = round_trip::<Manifest>(data) {
+        assert_descriptor(&manifest.config);
+        for layer in &manifest.layers {
+            assert_descriptor(layer);
+        }
+    }
+    round_trip::<CncfModelConfig>(data);
+    round_trip::<crate::hf::oci::Descriptor>(data);
+    round_trip::<crate::hf::oci::Manifest>(data);
+}
+
+/// Fuzz-target entry point (see `fuzz/fuzz_targets/parse_oci_json.rs`).
+/// Feature-gated so it is absent from every normal build; the `fuzzing`
+/// feature only widens visibility, it does not change parsing behavior.
+/// Panics whenever a successful parse of `data` as any stored OCI JSON
+/// document violates [`assert_oci_json_invariants`]. The
+/// `parse_oci_json_oracle_holds_on_the_seed_corpus` unit test pins the same
+/// oracle against the seed corpus.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_check_parse_oci_json(data: &[u8]) {
+    assert_oci_json_invariants(data);
+}
+
 /// Build an in-memory uncompressed tar archive containing a single file.
 fn make_single_file_tar(path: &Path, name: &str) -> anyhow::Result<Vec<u8>> {
     let file_data = fs::read(path).with_context(|| format!("read {}", path.display()))?;
@@ -1505,5 +1619,25 @@ mod tests {
         assert!(!err.to_string().contains("not found"), "got: {err}");
 
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Sanity-runs the `fuzz_check_parse_oci_json` oracle against the
+    /// checked-in seed corpus on every `cargo test`. Calls the shared
+    /// `cfg(any(test, feature = "fuzzing"))` oracle directly rather than
+    /// the feature-gated wrapper, so this runs in a plain
+    /// `cargo test --lib` with no `fuzzing` feature required.
+    #[test]
+    fn parse_oci_json_oracle_holds_on_the_seed_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/parse_oci_json");
+        let mut seeds = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read the seed corpus directory") {
+            let path = entry.expect("read a corpus directory entry").path();
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            seeds += 1;
+            assert_oci_json_invariants(&data);
+        }
+        // A wrong path must fail loudly, not pass over zero files.
+        assert!(seeds > 0, "seed corpus at {dir:?} is empty");
     }
 }

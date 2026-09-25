@@ -259,14 +259,22 @@ impl<R: Read> Reader<R> {
 /// quantization without loading the model itself.
 pub fn read_info(path: &Path) -> anyhow::Result<Info> {
     let file = File::open(path).with_context(|| format!("open {}", path.display()))?;
-    let mut r = Reader {
-        inner: BufReader::new(file),
-    };
+    let (info, _) =
+        read_header(BufReader::new(file)).with_context(|| format!("read {}", path.display()))?;
+    Ok(info)
+}
+
+/// [`read_info`]'s parser, over any byte source (a file, or an in-memory
+/// buffer for the fuzz target). Also returns the tensor-info entries the
+/// [`Info`] was derived from, so the fuzz oracle can recompute
+/// `parameter_count` and `quantization` independently.
+fn read_header<R: Read>(inner: R) -> anyhow::Result<(Info, Vec<TensorInfo>)> {
+    let mut r = Reader { inner };
 
     let mut magic = [0u8; 4];
     r.inner.read_exact(&mut magic).context("read GGUF magic")?;
     if &magic != b"GGUF" {
-        bail!("not a GGUF file: {}", path.display());
+        bail!("not a GGUF file");
     }
     let version = r.u32().context("read GGUF version")?;
     if version < 2 {
@@ -318,12 +326,132 @@ pub fn read_info(path: &Path) -> anyhow::Result<Info> {
 
     let quantization = dominant_quantization(&tensors);
 
-    Ok(Info {
-        metadata,
-        tensor_count,
-        parameter_count,
-        quantization,
-    })
+    Ok((
+        Info {
+            metadata,
+            tensor_count,
+            parameter_count,
+            quantization,
+        },
+        tensors,
+    ))
+}
+
+/// Parses `data` as a GGUF header and panics unless every successful parse
+/// holds the invariants `cmd::show` and `/api/show` rely on. Shared oracle
+/// for the fuzz target and the seed-corpus unit test.
+///
+/// Recomputed independently of [`read_header`] rather than reusing its
+/// intermediate values, so a regression there is what this catches:
+///   - `tensor_count` equals the number of tensor-info entries read, and
+///     every entry has rank <= 8 (the reader rejects higher ranks);
+///   - `metadata.len() <= metadata_kv_count`, the header's declared count
+///     re-read from bytes 16..24 (`<=`, not `==`: the metadata map is a
+///     `HashMap` filled by `insert`, so a file repeating a key collapses
+///     the duplicates);
+///   - `parameter_count` equals a saturating recomputation over `dims`
+///     (u128 saturating mul/add, clamped to `u64::MAX`), so a hostile dim
+///     saturates instead of overflowing;
+///   - `quantization` is `Some` iff at least one tensor has rank >= 2, and
+///     names a `ggml_type` from the table or the "unknown" placeholder;
+///   - every string value is at most 3 * 64 MiB (the reader bounds the
+///     encoded bytes at 64 MiB and decodes lossily, so each invalid byte
+///     may expand to a 3-byte U+FFFD), every array at most 10_000_000
+///     elements and nested at most 8 deep, mirroring the reader's
+///     allocation bounds.
+#[cfg(any(test, feature = "fuzzing"))]
+fn assert_gguf_header_invariants(data: &[u8]) {
+    let Ok((info, tensors)) = read_header(std::io::Cursor::new(data)) else {
+        return;
+    };
+    // Header layout: magic[4] version[4] tensor_count[8] metadata_kv_count[8].
+    let declared_kv_count = u64::from_le_bytes(data[16..24].try_into().unwrap());
+    assert!(
+        info.metadata.len() as u64 <= declared_kv_count,
+        "metadata has {} entries but the header declares {declared_kv_count}",
+        info.metadata.len()
+    );
+    assert_eq!(
+        info.tensor_count,
+        tensors.len() as u64,
+        "tensor_count disagrees with the number of tensor-info entries read"
+    );
+    for t in &tensors {
+        assert!(
+            t.dims.len() <= 8,
+            "tensor {:?} has rank {} past the reader's limit",
+            t.name,
+            t.dims.len()
+        );
+    }
+
+    let mut expected_params = 0u128;
+    for t in &tensors {
+        let mut elems = 1u128;
+        for &d in &t.dims {
+            elems = elems.saturating_mul(d as u128);
+        }
+        expected_params = expected_params.saturating_add(elems);
+    }
+    let expected_params = expected_params.min(u64::MAX as u128) as u64;
+    assert_eq!(
+        info.parameter_count, expected_params,
+        "parameter_count did not saturate the way the oracle expects"
+    );
+
+    let has_matrix = tensors.iter().any(|t| t.dims.len() >= 2);
+    match &info.quantization {
+        Some(name) => {
+            assert!(
+                has_matrix,
+                "quantization {name:?} reported with no rank>=2 tensor"
+            );
+            assert!(
+                name == "unknown" || (0..=41).any(|ty| ggml_type_name(ty) == name),
+                "quantization {name:?} is neither a ggml_type name nor \"unknown\""
+            );
+        }
+        None => assert!(!has_matrix, "quantization is None despite a rank>=2 tensor"),
+    }
+
+    fn assert_value_bounds(key: &str, v: &Value, depth: u32) {
+        assert!(depth <= 8, "metadata {key:?} nests deeper than 8 levels");
+        match v {
+            // Decoded length: the 64 MiB encoded bound times the worst
+            // case `from_utf8_lossy` expansion (one byte -> U+FFFD).
+            Value::String(s) => assert!(
+                s.len() <= 3 * 64 * 1024 * 1024,
+                "metadata {key:?} holds a string past the 192 MiB decoded bound"
+            ),
+            Value::Array(items) => {
+                assert!(
+                    items.len() <= 10_000_000,
+                    "metadata {key:?} holds an array past the 10M-element bound"
+                );
+                for item in items {
+                    assert_value_bounds(key, item, depth + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+    for (key, value) in &info.metadata {
+        assert_value_bounds(key, value, 0);
+    }
+}
+
+/// Fuzz-target entry point (see `fuzz/fuzz_targets/read_gguf_info.rs`).
+/// Feature-gated so it is absent from every normal build; the `fuzzing`
+/// feature only widens visibility, it does not change parsing behavior.
+/// Parses `data` in memory through the same [`read_header`] that
+/// [`read_info`] uses on files, and panics whenever a successful parse
+/// violates [`assert_gguf_header_invariants`]. The
+/// `read_gguf_info_oracle_holds_on_the_seed_corpus` unit test pins the same
+/// oracle against the seed corpus.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub fn fuzz_check_read_gguf_info(data: &[u8]) {
+    assert_gguf_header_invariants(data);
 }
 
 /// `general.file_type`'s name — llama.cpp's `llama_ftype`, transcribed
@@ -595,7 +723,56 @@ mod tests {
         std::fs::write(&path, b"not a gguf file at all").unwrap();
         let err = read_info(&path).unwrap_err();
         std::fs::remove_file(&path).ok();
-        assert!(err.to_string().contains("not a GGUF file"));
+        // `{:#}` walks the chain: the path is the outer context, the
+        // magic check is the cause.
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a GGUF file"), "got: {msg}");
+        assert!(msg.contains(&path.display().to_string()), "got: {msg}");
+    }
+
+    /// Sanity-runs the `fuzz_check_read_gguf_info` oracle against the
+    /// checked-in seed corpus on every `cargo test`. Calls the shared
+    /// `cfg(any(test, feature = "fuzzing"))` oracle directly rather than
+    /// the feature-gated wrapper, so this runs in a plain
+    /// `cargo test --lib` with no `fuzzing` feature required.
+    #[test]
+    fn read_gguf_info_oracle_holds_on_the_seed_corpus() {
+        let dir =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("fuzz/corpus/read_gguf_info");
+        let mut seeds = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("read the seed corpus directory") {
+            let path = entry.expect("read a corpus directory entry").path();
+            let data = std::fs::read(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+            seeds += 1;
+            assert_gguf_header_invariants(&data);
+        }
+        // A wrong path must fail loudly, not pass over zero files.
+        assert!(seeds > 0, "seed corpus at {dir:?} is empty");
+    }
+
+    /// Regression test: the reader bounds the encoded string length at
+    /// 64 MiB and then decodes lossily, so a string of 64 MiB of invalid
+    /// UTF-8 parses fine and expands to 192 MiB of U+FFFD. The oracle
+    /// must accept what the reader accepts.
+    #[test]
+    fn oracle_accepts_a_lossily_expanded_max_length_string() {
+        let len = 64 * 1024 * 1024usize;
+        let mut buf = Vec::with_capacity(len + 64);
+        buf.extend_from_slice(b"GGUF");
+        buf.extend_from_slice(&3u32.to_le_bytes()); // version
+        buf.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        buf.extend_from_slice(&1u64.to_le_bytes()); // metadata_kv_count
+        write_string(&mut buf, "test.invalid_utf8");
+        buf.extend_from_slice(&8u32.to_le_bytes()); // value type: STRING
+        buf.extend_from_slice(&(len as u64).to_le_bytes());
+        buf.resize(buf.len() + len, 0xff);
+
+        let (info, _) = read_header(std::io::Cursor::new(&buf)).unwrap();
+        match &info.metadata["test.invalid_utf8"] {
+            Value::String(s) => assert_eq!(s.len(), 3 * len),
+            other => panic!("expected a string, got {other:?}"),
+        }
+        assert_gguf_header_invariants(&buf);
     }
 
     #[test]

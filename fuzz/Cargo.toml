@@ -34,3 +34,17 @@ path = "fuzz_targets/resolve_ollama_api.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "read_gguf_info"
+path = "fuzz_targets/read_gguf_info.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parse_oci_json"
+path = "fuzz_targets/parse_oci_json.rs"
+test = false
+doc = false
+bench = false

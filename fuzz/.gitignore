@@ -7,3 +7,5 @@ corpus/*
 !corpus/parse_registry_ref/
 !corpus/validate_reference/
 !corpus/resolve_ollama_api/
+!corpus/read_gguf_info/
+!corpus/parse_oci_json/
