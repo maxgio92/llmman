@@ -3,6 +3,8 @@
 #
 #   packaging/version.sh            # print it, e.g. 0.1.324
 #   packaging/version.sh --apply    # also write it into Cargo.toml + Cargo.lock
+#                                   # (and fuzz/Cargo.lock, which pins the
+#                                   # root crate by path)
 #
 # Every commit on main is a release, published to GitHub Releases,
 # crates.io, Homebrew and scoop at once, so the version is
@@ -37,7 +39,10 @@ esac
 
 REPO_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 MANIFEST="$REPO_ROOT/Cargo.toml"
-LOCKFILE="$REPO_ROOT/Cargo.lock"
+# fuzz/Cargo.lock records the root crate too (path dependency), so a
+# stamped tree fails `cargo check --manifest-path fuzz/Cargo.toml --locked`
+# unless it is stamped alongside.
+LOCKFILES=("$REPO_ROOT/Cargo.lock" "$REPO_ROOT/fuzz/Cargo.lock")
 
 # First `version = "..."` inside [package] only.
 read_manifest_version() {
@@ -58,7 +63,7 @@ read_lock_version() {
 	awk '
 		hit && /^version = / { gsub(/^[^"]*"|".*$/, ""); print; exit }
 		/^name = "llmman"$/ { hit = 1 }
-	' "$LOCKFILE"
+	' "$1"
 }
 
 BASE="$(read_manifest_version)"
@@ -98,23 +103,25 @@ if [ "$APPLY" -eq 1 ]; then
 	# Cargo.lock has its own entry for the root package, and `cargo publish
 	# --locked` refuses to run if it disagrees. Edited directly: `cargo
 	# update --workspace` would need the registry index.
-	if [ -f "$LOCKFILE" ]; then
+	for lockfile in "${LOCKFILES[@]}"; do
+		[ -f "$lockfile" ] || continue
 		awk -v v="$VERSION" '
 			hit && /^version = / { sub(/"[^"]*"/, "\"" v "\""); hit = 0 }
 			/^name = "llmman"$/ { hit = 1 }
 			{ print }
-		' "$LOCKFILE" >"$LOCKFILE.tmp" && mv "$LOCKFILE.tmp" "$LOCKFILE"
-	fi
+		' "$lockfile" >"$lockfile.tmp" && mv "$lockfile.tmp" "$lockfile"
+	done
 
 	# Read back: a Cargo.toml reshuffle that broke the edit above must not
 	# silently publish the placeholder 0.x.0.
 	check="$(read_manifest_version)"
 	[ "$check" = "$VERSION" ] || die "failed to write version $VERSION to $MANIFEST (got \"$check\")"
-	if [ -f "$LOCKFILE" ]; then
-		check="$(read_lock_version)"
-		[ "$check" = "$VERSION" ] || die "failed to write version $VERSION to $LOCKFILE (got \"$check\")"
-	fi
-	printf 'version.sh: applied %s to Cargo.toml and Cargo.lock\n' "$VERSION" >&2
+	for lockfile in "${LOCKFILES[@]}"; do
+		[ -f "$lockfile" ] || continue
+		check="$(read_lock_version "$lockfile")"
+		[ "$check" = "$VERSION" ] || die "failed to write version $VERSION to $lockfile (got \"$check\")"
+	done
+	printf 'version.sh: applied %s to Cargo.toml, Cargo.lock and fuzz/Cargo.lock\n' "$VERSION" >&2
 fi
 
 printf '%s\n' "$VERSION"
